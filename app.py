@@ -45,6 +45,10 @@ def load_env_file(path: Path) -> None:
         os.environ.setdefault(key, value)
 
 
+def env_str(name: str, default: str = "") -> str:
+    return os.getenv(name, default).strip()
+
+
 def env_bool(name: str, default: bool) -> bool:
     raw = os.getenv(name)
     if raw is None:
@@ -74,7 +78,7 @@ def parse_bearer_token(value: str | None) -> str | None:
         return None
     prefix = "bearer "
     if value.lower().startswith(prefix):
-        return value[len(prefix) :].strip() or None
+        return value[len(prefix):].strip() or None
     return value.strip() or None
 
 
@@ -98,27 +102,31 @@ class Settings:
     tls_verify: bool
     anthropic_version: str
 
+    # 客户端指纹模拟
+    device_id: str
+    machine_id: str
+    platform: str
+    os: str
+    client_version: str
+
     @classmethod
     def from_env(cls) -> "Settings":
         return cls(
-            tocodex_base_url=normalize_base_url(
-                os.getenv("TOCODEX_BASE_URL", "https://api.tocodex.com")
-            ),
-            tocodex_hmac_secret=os.getenv(
-                "TOCODEX_HMAC_SECRET",
-                "tc-hmac-s3cr3t-k3y-2026-tocodex-platform",
-            ),
+            tocodex_base_url=normalize_base_url(os.getenv("TOCODEX_BASE_URL", "https://api.tocodex.com")),
+            tocodex_hmac_secret=os.getenv("TOCODEX_HMAC_SECRET", "tc-hmac-s3cr3t-k3y-2026-tocodex-platform"),
             tocodex_api_key=os.getenv("TOCODEX_API_KEY") or None,
-            tocodex_referer=os.getenv(
-                "TOCODEX_REFERER",
-                "https://github.com/tocodex/ToCodex",
-            ),
+            tocodex_referer=os.getenv("TOCODEX_REFERER", "https://app.tocodex.com/"),
             tocodex_title=os.getenv("TOCODEX_TITLE", "ToCodex"),
             tocodex_app_version=os.getenv("TOCODEX_APP_VERSION", "3.1.3"),
             default_model=os.getenv("TOCODEX_DEFAULT_MODEL") or None,
             timeout_seconds=float(os.getenv("TOCODEX_TIMEOUT_SECONDS", "600")),
             tls_verify=env_bool("TOCODEX_TLS_VERIFY", True),
             anthropic_version=os.getenv("ANTHROPIC_VERSION", "2023-06-01"),
+            device_id=env_str("TOCODEX_DEVICE_ID", "windows-server-2016-abc123-def456-7890"),
+            machine_id=env_str("TOCODEX_MACHINE_ID", "machine-xyz789-abc123"),
+            platform=env_str("TOCODEX_PLATFORM", "Windows"),
+            os=env_str("TOCODEX_OS", "Windows 10"),
+            client_version=env_str("TOCODEX_CLIENT_VERSION", "1.0.0"),
         )
 
 
@@ -127,31 +135,16 @@ load_env_file(Path(__file__).with_name(".env"))
 SETTINGS = Settings.from_env()
 
 
-@dataclass
-class AnthropicToolStreamState:
-    call_id: str = field(default_factory=lambda: new_id("toolu"))
-    name: str | None = None
-    block_index: int | None = None
-    started: bool = False
-    arguments_parts: list[str] = field(default_factory=list)
-    buffered_argument_parts: list[str] = field(default_factory=list)
-
-
-@dataclass
-class ResponsesToolStreamState:
-    item_id: str = field(default_factory=lambda: new_id("fc"))
-    call_id: str = field(default_factory=lambda: new_id("call"))
-    name: str | None = None
-    output_index: int | None = None
-    started: bool = False
-    arguments_parts: list[str] = field(default_factory=list)
-    buffered_argument_parts: list[str] = field(default_factory=list)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     timeout = httpx.Timeout(timeout=SETTINGS.timeout_seconds, connect=10.0)
-    async with httpx.AsyncClient(timeout=timeout, verify=SETTINGS.tls_verify) as client:
+    # 强制不走系统代理（解决 Clash 问题）
+    proxies = {"all://": None}
+    async with httpx.AsyncClient(
+        timeout=timeout,
+        verify=SETTINGS.tls_verify,
+        proxies=proxies
+    ) as client:
         app.state.http = client
         yield
 
@@ -163,6 +156,64 @@ app = FastAPI(
 )
 
 app.state.responses_sessions = {}
+
+
+# ==================== 优化后的 Headers（核心） ====================
+def signed_tocodex_headers(
+    path: str,
+    api_key: str | None,
+    *,
+    task_id: str | None = None,
+    session_id: str | None = None,
+) -> dict[str, str]:
+    headers = {
+        "Host": "api.tocodex.com",
+        "Content-Type": "application/json",
+        "User-Agent": f"Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.6099.109 Safari/537.36 ToCodex-Client/{SETTINGS.client_version}",
+        "X-Session-ID": session_id or f"550e8400-e29b-41d4-a716-{uuid.uuid4().hex[:12]}",
+        "X-Device-ID": SETTINGS.device_id,
+        "X-Machine-ID": SETTINGS.machine_id,
+        "X-Client-Version": SETTINGS.client_version,
+        "X-Mode": "architect",
+        "X-Platform": SETTINGS.platform,
+        "X-OS": SETTINGS.os,
+        "X-Client-Name": "ToCodex-Client",
+        "Referer": SETTINGS.tocodex_referer,
+        "Accept": "application/json, text/plain, */*",
+        "Accept-Encoding": "gzip, deflate, br, zstd",
+        "Accept-Language": "zh-CN,zh;q=0.9,en;q=0.8,en-US;q=0.7",
+        "Connection": "keep-alive",
+        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "cors",
+        "Sec-Fetch-Site": "cross-site",
+        "Cache-Control": "no-cache",
+        "Pragma": "no-cache",
+    }
+
+    if api_key:
+        headers["Authorization"] = f"Bearer {api_key}"
+
+    # HMAC 签名（必须）
+    timestamp = str(int(time.time()))
+    nonce = str(uuid.uuid4())
+    sign_raw = f"{timestamp}:{nonce}:POST:{path}"
+    signature = hmac.new(
+        SETTINGS.tocodex_hmac_secret.encode("utf-8"),
+        sign_raw.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+
+    headers.update({
+        "X-Roo-App-Version": SETTINGS.tocodex_app_version,
+        "X-ToCodex-Timestamp": timestamp,
+        "X-ToCodex-Nonce": nonce,
+        "X-ToCodex-Sig": signature,
+    })
+
+    if task_id:
+        headers["X-Roo-Task-ID"] = task_id
+
+    return headers
 
 
 def make_error_message(payload: Any, fallback: str) -> str:
