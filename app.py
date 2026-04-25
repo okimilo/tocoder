@@ -138,12 +138,9 @@ SETTINGS = Settings.from_env()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     timeout = httpx.Timeout(timeout=SETTINGS.timeout_seconds, connect=10.0)
-    # 强制不走系统代理（解决 Clash 问题）
-    proxies = {"all://": None}
     async with httpx.AsyncClient(
         timeout=timeout,
-        verify=SETTINGS.tls_verify,
-        proxies=proxies
+        verify=SETTINGS.tls_verify
     ) as client:
         app.state.http = client
         yield
