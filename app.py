@@ -138,6 +138,7 @@ SETTINGS = Settings.from_env()
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     timeout = httpx.Timeout(timeout=SETTINGS.timeout_seconds, connect=10.0)
+    # 简化版，不加 proxies，避免兼容性问题
     async with httpx.AsyncClient(
         timeout=timeout,
         verify=SETTINGS.tls_verify
